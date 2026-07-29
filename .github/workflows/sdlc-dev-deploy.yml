@@ -269,7 +269,9 @@ jobs:
           case "$TUNNEL_PROVIDER" in
             devtunnel)
               if ! command -v devtunnel >/dev/null 2>&1; then
-                curl -sL https://aka.ms/DevTunnelCliInstall | bash
+                curl -fsSL https://aka.ms/DevTunnelCliInstall -o devtunnel-install.sh
+                bash devtunnel-install.sh
+                rm -f devtunnel-install.sh
                 export PATH="$HOME/bin:$PATH"
               fi
               # The runner must be authenticated to the dev tunnel service. On a persistent
