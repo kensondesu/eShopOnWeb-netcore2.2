@@ -258,3 +258,6 @@ pub/
 #Ignore marker-file used to know which docker files we have.
 .eshopdocker_*
 \.vscode/
+
+# Local Copilot CLI telemetry captures from sdlc runs — a debugging artifact, not source.
+telemetry-out/

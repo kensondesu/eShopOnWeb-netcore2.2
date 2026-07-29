@@ -1,0 +1,26 @@
+{
+  "name": "Eshoponweb Netcore2.2 SDLC",
+  "url": "https://github.com/kensondesu/eShopOnWeb-netcore2.2",
+  "description": "Runs the agentic SDLC for Eshoponweb Netcore2.2: branch, specify, implement, gate and promote.",
+  "public": false,"hook_attributes": {
+    "url": "https://example.invalid/api/github/webhook",
+    "active": false
+  },
+  "default_events": [
+    "deployment_protection_rule",
+    "deployment_status",
+    "issue_comment",
+    "pull_request",
+    "workflow_run"
+  ],
+  "default_permissions": {
+    "actions": "write",
+    "checks": "read",
+    "contents": "write",
+    "deployments": "write",
+    "environments": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write"
+  }
+}

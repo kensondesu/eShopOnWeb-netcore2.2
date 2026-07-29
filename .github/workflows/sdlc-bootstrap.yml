@@ -1,0 +1,94 @@
+name: SDLC bootstrap
+
+# Run once after adopting the template, and again after every `copier update` or reviewer change.
+# Every operation reconciles rather than creates, so running it twice is not just safe but the
+# expected way to use it.
+on:
+  workflow_dispatch:
+    inputs:
+      production_reviewers:
+        description: Comma-separated GitHub user ids required to approve a production deployment
+        required: false
+        type: string
+      qa_reviewers:
+        description: Comma-separated user ids gating QA. Ignored when Teams approvals are enabled.
+        required: false
+        type: string
+      required_checks:
+        description: Space-separated status check contexts a pull request must pass to merge
+        required: false
+        type: string
+      enterprise:
+        description: >-
+          This repository is on GitHub Enterprise Cloud. Push rulesets with file-path restrictions
+          are ignored on other plans, so they are skipped rather than creating false confidence.
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: Print the plan without changing anything
+        required: false
+        default: true
+        type: boolean
+
+# Two concurrent bootstraps would each read the ruleset list before either had written, and the
+# second would create a duplicate instead of updating.
+concurrency:
+  group: sdlc-bootstrap
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  bootstrap:
+    name: Apply rulesets and environments
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      - name: Apply the governance plan
+        env:
+          # Not an App token. Creating an environment, attaching a deployment protection rule and
+          # applying a ruleset all need repository Administration, which the SDLC App deliberately
+          # does not hold; an installation token gets `403 Resource not accessible by integration`
+          # from every one of them. SDLC_ADMIN_TOKEN is a PAT with `repo`, held by whoever owns the
+          # repository's governance. SDLC_APP_ID is still read — it is the App attached to `qa`.
+          SDLC_ADMIN_TOKEN: ${{ secrets.SDLC_ADMIN_TOKEN }}
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          PRODUCTION_REVIEWERS: ${{ inputs.production_reviewers }}
+          QA_REVIEWERS: ${{ inputs.qa_reviewers }}
+          REQUIRED_CHECKS: ${{ inputs.required_checks }}
+          ENTERPRISE: ${{ inputs.enterprise }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "$PRODUCTION_REVIEWERS" ]; then
+            args+=(--production-reviewers "$PRODUCTION_REVIEWERS")
+          fi
+          if [ -n "$QA_REVIEWERS" ]; then
+            args+=(--qa-reviewers "$QA_REVIEWERS")
+          fi
+          if [ "$ENTERPRISE" = "true" ]; then
+            args+=(--enterprise)
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          # Word splitting is intended here: the input is a list of check contexts.
+          # shellcheck disable=SC2206
+          if [ -n "$REQUIRED_CHECKS" ]; then
+            args+=(--required-check $REQUIRED_CHECKS)
+          fi
+          sdlc bootstrap "${args[@]}"

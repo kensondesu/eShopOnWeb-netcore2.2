@@ -1,0 +1,25 @@
+# Changes here will be overwritten by Copier; edit copier.yml in the template instead.
+_commit: 1afb444
+_src_path: /home/fsantos/projects/01 - Tests/agentic_sdlc
+base_branch: main
+branch_prefix: feature/
+capture_content: false
+cloud_target: none-localhost
+dev_env_strategy: localhost
+github_owner: kensondesu
+github_repo: eShopOnWeb-netcore2.2
+implementer_model: claude-sonnet-4.6
+llm_provider: copilot
+max_cost_per_feature_usd: 25.0
+max_turns: 500
+observability_mode: file-only
+orchestrator_model: claude-opus-4.6
+project_name: Eshoponweb Netcore2.2
+reasoning_effort: high
+reviewer_model: claude-sonnet-4.6
+sdlc_toolkit_ref: main
+sdlc_toolkit_repo: kensondesu/agentic_sdlc
+teams_approvals: false
+test_command: dotnet test
+usd_per_aiu: 0.01
+usd_per_premium_request: 0.04

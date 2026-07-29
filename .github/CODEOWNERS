@@ -1,0 +1,13 @@
+# Code ownership.
+#
+# Two entries here are load-bearing for the agentic SDLC and should survive any reorganisation of
+# this file: the workflow directory and this file itself. The agent is forbidden from editing
+# either — by the permission policy inside the run and by a repository ruleset on the push — and
+# requiring a human owner on them is the third layer. Together they mean a change to what the agent
+# is allowed to do cannot be made by the agent.
+
+* @kensondesu
+
+/.github/workflows/ @kensondesu
+/.github/CODEOWNERS @kensondesu
+/.sdlc/constitution.md @kensondesu

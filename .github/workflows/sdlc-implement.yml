@@ -1,0 +1,124 @@
+name: SDLC implement
+
+# Callable both from intake and on its own, because implementation is the long, expensive,
+# frequently-retried part of the loop. Retrying it must re-run the agent, not allocate a second
+# feature number.
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+      issue_number:
+        required: false
+        type: number
+      pr_number:
+        required: false
+        type: number
+      requester:
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Feature branch to implement, e.g. feature/001-add-widget
+        required: true
+        type: string
+      issue_number:
+        description: Issue bound to the branch
+        required: false
+        type: number
+      requester:
+        required: false
+        type: string
+
+# One run per branch. A second run on the same branch would race the first's commits and produce a
+# diff neither agent intended.
+concurrency:
+  group: sdlc-implement-${{ inputs.branch }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  implement:
+    name: Write the code
+    runs-on: ubuntu-latest
+    # Agent runs are long. This is the outer bound; `budget.max_turns` and the cost ceiling in
+    # .sdlc/config.yml are the ones that usually stop a runaway run first, and they stop it with a
+    # message rather than a timeout.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.SDLC_APP_ID }}
+          private-key: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+
+      - name: Check out the feature branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.branch }}
+          # Full history so the agent can read why the surrounding code looks the way it does,
+          # which is most of what makes a brownfield change fit in.
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      # The agent commits; these trailers are what make an agent commit attributable months later.
+      - name: Configure git for the agent
+        env:
+          SDLC_REQUESTER: ${{ inputs.requester }}
+        run: |
+          set -euo pipefail
+          git config user.name "Eshoponweb Netcore2.2 SDLC agent"
+          git config user.email "${{ vars.SDLC_APP_ID }}+sdlc[bot]@users.noreply.github.com"
+
+      - name: Run the implementer
+        id: implement
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          SDLC_BRANCH: ${{ inputs.branch }}
+          SDLC_ISSUE: ${{ inputs.issue_number }}
+          SDLC_REQUESTER: ${{ inputs.requester }}
+        run: |
+          set -euo pipefail
+          args=(--branch "$SDLC_BRANCH" --requester "$SDLC_REQUESTER" --timeout-minutes 60)
+          if [ -n "$SDLC_ISSUE" ]; then args+=(--issue "$SDLC_ISSUE"); fi
+          args+=(--test-command 'dotnet test')
+          sdlc implement "${args[@]}"
+
+      - name: Push the agent's commits
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          SDLC_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git log "origin/$SDLC_BRANCH"..HEAD --oneline)" ]; then
+            echo "The agent produced no commits." >&2
+            exit 1
+          fi
+          # Never --force: the pull request is reviewed by a human who needs a stable diff.
+          git push origin "HEAD:$SDLC_BRANCH"
+
+      - name: Upload the telemetry sink
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-implement-${{ github.run_id }}-${{ github.run_attempt }}
+          path: telemetry-out/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # The pull request stays a draft on failure. A draft is the honest signal that nobody should
+      # be asked to review this yet.
+      - name: Mark the pull request ready for review
+        if: success() && inputs.pr_number
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh pr ready "${{ inputs.pr_number }}" --repo "${{ github.repository }}"
