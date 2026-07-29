@@ -269,9 +269,13 @@ jobs:
           case "$TUNNEL_PROVIDER" in
             devtunnel)
               if ! command -v devtunnel >/dev/null 2>&1; then
-                curl -fsSL https://aka.ms/DevTunnelCliInstall -o devtunnel-install.sh
-                bash devtunnel-install.sh
-                rm -f devtunnel-install.sh
+                # Downloaded to a file and then run, rather than piped straight into bash. Without
+                # --fail, curl exits 0 on an HTTP 404 or 502 and pipes the error page into the
+                # shell, which then fails somewhere inside the redirect's HTML with a message that
+                # says nothing about the download. Landing it first means the failure names itself.
+                curl --fail --silent --show-error --location \
+                  --output /tmp/devtunnel-install.sh https://aka.ms/DevTunnelCliInstall
+                bash /tmp/devtunnel-install.sh
                 export PATH="$HOME/bin:$PATH"
               fi
               # The runner must be authenticated to the dev tunnel service. On a persistent

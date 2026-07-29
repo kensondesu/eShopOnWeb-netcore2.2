@@ -19,10 +19,6 @@ on:
         description: Commit to promote. It must already have succeeded on QA.
         required: true
         type: string
-      qa_run_id:
-        description: Workflow run id of the SDLC QA promote run that produced the artifact.
-        required: true
-        type: number
 
 
 # Never cancel a production deployment in flight. A cancelled progressive rollout leaves traffic
@@ -48,8 +44,12 @@ jobs:
       # Reading the attestation this artifact was signed with.
       id-token: write
       attestations: read
+      # Finding the QA run that holds the approved artifact. Listing another workflow's runs is an
+      # Actions read, and the workflow grants no default permissions.
+      actions: read
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
+      qa-run-id: ${{ steps.qa-run.outputs.run-id }}
     steps:
       - name: Resolve the commit being promoted
         id: resolve
@@ -64,6 +64,35 @@ jobs:
             exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # The artifact lives in the QA run, not in this one. On the `workflow_run` path the event
+      # names that run directly; on a manual dispatch it does not exist, and the obvious fallback to
+      # `github.run_id` silently points the download at the production run itself — which has no
+      # artifact, so every manual promotion and every rollback would fail at the download step.
+      #
+      # Resolving it from the commit keeps one code path and keeps the dispatch input a commit,
+      # which is what a person re-promoting or rolling back actually knows.
+      - name: Resolve the QA run holding the approved artifact
+        id: qa-run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          REPOSITORY: ${{ github.repository }}
+          PROMOTION_SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$EVENT_RUN_ID" ]; then
+            echo "run-id=$EVENT_RUN_ID" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          run_id="$(gh api \
+            "repos/$REPOSITORY/actions/workflows/sdlc-qa-promote.yml/runs?head_sha=$PROMOTION_SHA&status=success&per_page=1" \
+            --jq '.workflow_runs[0].id // empty')"
+          if [ -z "$run_id" ]; then
+            echo "::error::No successful QA promotion run exists for $PROMOTION_SHA, so there is no approved artifact to promote. Promote it through QA first." >&2
+            exit 1
+          fi
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
 
       - name: Check out the commit being promoted
         uses: actions/checkout@v5
@@ -102,9 +131,11 @@ jobs:
       url: ${{ steps.deploy.outputs.url }}
     permissions:
       contents: read
-      actions: read
       id-token: write
       attestations: read
+      # download-artifact needs this to read an artifact belonging to a different run.
+      actions: read
+    env:
       PROMOTION_SHA: ${{ needs.verify.outputs.sha }}
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
@@ -127,7 +158,7 @@ jobs:
         with:
           name: sdlc-promotion-${{ needs.verify.outputs.sha }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id || github.run_id }}
+          run-id: ${{ needs.verify.outputs.qa-run-id }}
 
       - name: Verify the artifact's signed provenance
         env:
