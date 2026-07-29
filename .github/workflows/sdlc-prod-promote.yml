@@ -1,0 +1,262 @@
+name: SDLC production promote
+
+# Two ways in, and both promote a commit that already passed QA.
+#
+# `workflow_run` is the normal path: a successful QA promotion queues a production one immediately,
+# where it waits on required reviewers. Queuing it automatically is deliberate — a release that
+# depends on somebody remembering to start it is a release that sits unshipped, and the gate is the
+# reviewer, not the trigger.
+#
+# `workflow_dispatch` covers re-promotion and rollback, where the commit you want is explicitly not
+# the newest one.
+on:
+  workflow_run:
+    workflows: [SDLC QA promote]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to promote. It must already have succeeded on QA.
+        required: true
+        type: string
+
+
+# Never cancel a production deployment in flight. A cancelled progressive rollout leaves traffic
+# split between two versions with nothing left running to finish the shift.
+concurrency:
+  group: sdlc-production-promote
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  verify:
+    name: Verify the commit earned promotion
+    # A QA run that failed must not queue a production one. Without this the `workflow_run` trigger
+    # fires on completion of *any* outcome, including cancelled.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Reading the attestation this artifact was signed with.
+      id-token: write
+      attestations: read
+      # Finding the QA run that holds the approved artifact. Listing another workflow's runs is an
+      # Actions read, and the workflow grants no default permissions.
+      actions: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      qa-run-id: ${{ steps.qa-run.outputs.run-id }}
+    steps:
+      - name: Resolve the commit being promoted
+        id: resolve
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          sha="${INPUT_SHA:-$RUN_SHA}"
+          if [ -z "$sha" ]; then
+            echo "::error::No commit to promote." >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # The artifact lives in the QA run, not in this one. On the `workflow_run` path the event
+      # names that run directly; on a manual dispatch it does not exist, and the obvious fallback to
+      # `github.run_id` silently points the download at the production run itself — which has no
+      # artifact, so every manual promotion and every rollback would fail at the download step.
+      #
+      # Resolving it from the commit keeps one code path and keeps the dispatch input a commit,
+      # which is what a person re-promoting or rolling back actually knows.
+      - name: Resolve the QA run holding the approved artifact
+        id: qa-run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          REPOSITORY: ${{ github.repository }}
+          PROMOTION_SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$EVENT_RUN_ID" ]; then
+            echo "run-id=$EVENT_RUN_ID" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          run_id="$(gh api \
+            "repos/$REPOSITORY/actions/workflows/sdlc-qa-promote.yml/runs?head_sha=$PROMOTION_SHA&status=success&per_page=1" \
+            --jq '.workflow_runs[0].id // empty')"
+          if [ -z "$run_id" ]; then
+            echo "::error::No successful QA promotion run exists for $PROMOTION_SHA, so there is no approved artifact to promote. Promote it through QA first." >&2
+            exit 1
+          fi
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the commit being promoted
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      # The gate runs *before* the job that asks for reviewers, so a commit that never passed QA is
+      # rejected by the machine rather than presented to a human for approval. Asking someone to
+      # approve a deployment whose provenance we could have checked and did not is how a review
+      # becomes a rubber stamp.
+      - name: Refuse a commit that never passed QA
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          PROMOTION_SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          sdlc promote verify --sha "$PROMOTION_SHA" --required-environment qa
+
+  production:
+    name: Deploy to production
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Production is gated by GitHub's *native* required reviewers, not by the Teams card that gates
+    # QA. That is deliberate: GitHub records an immutable audit trail for native approvals, and the
+    # highest-risk gate is the one where we want the platform's record rather than our own.
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+      # download-artifact needs this to read an artifact belonging to a different run.
+      actions: read
+    env:
+      PROMOTION_SHA: ${{ needs.verify.outputs.sha }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Check out the approved commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      # Downloaded, never rebuilt. Rebuilding from the same commit would produce an artifact QA
+      # never saw: a dependency published in between changes the bytes without changing the source.
+      - name: Download the exact artifact QA approved
+        uses: actions/download-artifact@v4
+        with:
+          name: sdlc-promotion-${{ needs.verify.outputs.sha }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ needs.verify.outputs.qa-run-id }}
+
+      - name: Verify the artifact's signed provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Proves this artifact was produced by this repository's QA workflow, not uploaded by
+          # something else. Without it the digest only proves the bytes did not change — not where
+          # they came from.
+          gh attestation verify artifact.tar --repo "$REPOSITORY"
+
+      - name: Sign in to Azure
+        if: env.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Traffic moves in stages with a smoke test between each, so a bad release is caught while
+      # most users are still on the old one. `SDLC_PROD_SMOKE_COMMAND` is what makes this real: with
+      # no smoke test the stages are just pauses, and the workflow says so rather than implying a
+      # safety property it does not have.
+      - name: Deploy and shift traffic progressively
+        id: deploy
+        env:
+          PROD_DEPLOY_COMMAND: ${{ vars.SDLC_PROD_DEPLOY_COMMAND }}
+          PROD_SHIFT_COMMAND: ${{ vars.SDLC_PROD_SHIFT_COMMAND }}
+          PROD_SMOKE_COMMAND: ${{ vars.SDLC_PROD_SMOKE_COMMAND }}
+          PROD_STAGES: ${{ vars.SDLC_PROD_TRAFFIC_STAGES || '10 50 100' }}
+          PROD_URL: ${{ vars.SDLC_PROD_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PROD_DEPLOY_COMMAND" ]; then
+            echo "::warning::SDLC_PROD_DEPLOY_COMMAND is not set, so nothing was deployed to production. The approval and the promotion record are still real; set the variable to make the deployment real too."
+            echo "url=$PROD_URL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Deploy the new revision without giving it traffic. Every progressive strategy depends on
+          # the new version being live and idle before the first user reaches it.
+          bash -c "$PROD_DEPLOY_COMMAND"
+
+          if [ -z "$PROD_SHIFT_COMMAND" ]; then
+            echo "::warning::SDLC_PROD_SHIFT_COMMAND is not set, so traffic was not shifted progressively. The deploy command is assumed to have taken traffic itself."
+          else
+            if [ -z "$PROD_SMOKE_COMMAND" ]; then
+              echo "::warning::SDLC_PROD_SMOKE_COMMAND is not set. Traffic will be shifted in stages, but nothing checks the new revision between them, so a bad release reaches 100% as fast as a good one."
+            fi
+            for stage in $PROD_STAGES; do
+              echo "::group::Shifting $stage% of traffic"
+              SDLC_TRAFFIC_PERCENT="$stage" bash -c "$PROD_SHIFT_COMMAND"
+              if [ -n "$PROD_SMOKE_COMMAND" ]; then
+                if ! bash -c "$PROD_SMOKE_COMMAND"; then
+                  echo "::error::Smoke test failed at $stage% traffic. Rolling back." >&2
+                  echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+                  exit 1
+                fi
+              fi
+              echo "::endgroup::"
+            done
+          fi
+
+          echo "url=$PROD_URL" >> "$GITHUB_OUTPUT"
+
+      # Rollback runs on failure at any stage, including a failure that happened before any traffic
+      # moved. Sending traffic back to the previous revision when none had left it is harmless;
+      # not sending it back when some had is an outage.
+      - name: Roll back to the previous revision
+        if: failure()
+        env:
+          PROD_ROLLBACK_COMMAND: ${{ vars.SDLC_PROD_ROLLBACK_COMMAND }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PROD_ROLLBACK_COMMAND" ]; then
+            echo "::error::The production deployment failed and SDLC_PROD_ROLLBACK_COMMAND is not set, so traffic was left wherever the failure left it. Roll back by hand, then set the variable." >&2
+            exit 1
+          fi
+          bash -c "$PROD_ROLLBACK_COMMAND"
+          echo "Rolled production back to the previous revision." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record the production deployment
+        if: always()
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: |
+          set -euo pipefail
+          sdlc deploy report \
+            --ref "$PROMOTION_SHA" \
+            --environment production \
+            --state "$STATE" \
+            --environment-url "$DEPLOY_URL" \
+            --log-url "$RUN_URL" \
+            --description "Production promotion of the QA-approved artifact."

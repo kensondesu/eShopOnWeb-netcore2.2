@@ -1,0 +1,115 @@
+name: SDLC intake
+
+# `workflow_dispatch` is the entry point for every channel — the Teams bot, the `gh` CLI and a
+# human clicking Run workflow all arrive here, so there is exactly one intake path to reason about.
+# Dispatching with `return_run_details` gives the caller the run id immediately, which is what lets
+# the Teams bot correlate its conversation with this run before the run has produced anything.
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: What should be built, in the requester's own words
+        required: true
+        type: string
+      requester:
+        description: UPN of the person asking, recorded in the issue and every span
+        required: false
+        type: string
+      conversation_id:
+        description: Teams conversation id, for correlation
+        required: false
+        type: string
+      auto_implement:
+        description: Run the implementer immediately if the specification has no open questions
+        required: false
+        default: true
+        type: boolean
+
+# Feature numbers are allocated by scanning `.sdlc/specs/`, which is a read-modify-write over a
+# namespace shared by every concurrent request. Without this group two simultaneous requests both
+# see NNN as free and one loses its branch. `cancel-in-progress: false` because the loser must
+# wait, not die.
+concurrency:
+  group: sdlc-feature-allocation
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  intake:
+    name: Specify and open the pull request
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Everything that writes does so with the App token; the job's own token only reads.
+    permissions:
+      contents: read
+    outputs:
+      feature_number: ${{ steps.request.outputs.feature_number }}
+      branch: ${{ steps.request.outputs.branch }}
+      issue_number: ${{ steps.request.outputs.issue_number }}
+      pr_number: ${{ steps.request.outputs.pr_number }}
+      clarification_count: ${{ steps.request.outputs.clarification_count }}
+    steps:
+      # Never GITHUB_TOKEN. GitHub deliberately does not trigger workflow runs for events created
+      # by the default token, so a pull request opened with it never runs its required checks and
+      # sits forever on "Expected — Waiting for status to be reported" with nothing in the log to
+      # explain why.
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.SDLC_APP_ID }}
+          private-key: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          # The specification is written against the repository, so the agent needs the real tree.
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      - name: Specify, branch, open the issue and bind it with a draft pull request
+        id: request
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Free text from a business user. Passed through the environment, never interpolated into
+          # the shell, so a request containing backticks or `$(…)` is data rather than code.
+          SDLC_REQUEST: ${{ inputs.request }}
+          SDLC_REQUESTER: ${{ inputs.requester }}
+          SDLC_CONVERSATION_ID: ${{ inputs.conversation_id }}
+        run: |
+          set -euo pipefail
+          sdlc request "$SDLC_REQUEST" \
+            --requester "$SDLC_REQUESTER" \
+            --conversation-id "$SDLC_CONVERSATION_ID" \
+            --label sdlc
+
+      - name: Upload the telemetry sink
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemetry-intake-${{ github.run_id }}-${{ github.run_attempt }}
+          path: telemetry-out/
+          if-no-files-found: warn
+          retention-days: 30
+
+  implement:
+    name: Implement
+    needs: intake
+    # An unanswered question in the specification means the agent would be guessing, and a
+    # confidently-wrong implementation costs more to review than no implementation at all.
+    if: ${{ inputs.auto_implement && needs.intake.outputs.clarification_count == '0' }}
+    uses: ./.github/workflows/sdlc-implement.yml
+    with:
+      branch: ${{ needs.intake.outputs.branch }}
+      issue_number: ${{ fromJSON(needs.intake.outputs.issue_number) }}
+      pr_number: ${{ fromJSON(needs.intake.outputs.pr_number) }}
+      requester: ${{ inputs.requester }}
+    secrets: inherit

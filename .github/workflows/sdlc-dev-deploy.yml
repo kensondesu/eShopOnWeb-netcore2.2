@@ -1,0 +1,473 @@
+name: SDLC dev deploy
+
+# Every feature branch must land somewhere a human can look at it. Which "somewhere" is not
+# configured by hand — it is decided at run time by `sdlc deploy plan`, which inspects the
+# repository exactly the way `sdlc detect` does and picks a lane (azd, Terraform, Helm or
+# localhost). A brownfield repo therefore gets the right answer without being told; the override
+# exists only for when detection is wrong.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - main
+
+# One deploy per pull request. A new push supersedes the in-flight deploy rather than racing it.
+concurrency:
+  group: sdlc-dev-deploy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  plan:
+    name: Decide how this branch deploys
+    # Only agent branches get a Dev environment; the base branch deploys to qa and production.
+    if: startsWith(github.head_ref, 'feature/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      lane: ${{ steps.plan.outputs.lane }}
+      supported: ${{ steps.plan.outputs.supported }}
+      requires_teardown: ${{ steps.plan.outputs.requires_teardown }}
+      azure_env_name: ${{ steps.plan.outputs.azure_env_name }}
+      environment: ${{ steps.plan.outputs.environment }}
+      pr_environment: ${{ steps.plan.outputs.pr_environment }}
+    steps:
+      - name: Check out the feature branch
+        uses: actions/checkout@v5
+        with:
+          # The plan is computed against the branch's own tree, so detection sees the manifests this
+          # feature actually carries.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      - name: Plan the deployment
+        id: plan
+        env:
+          # The pull request number names the per-PR environment. Passed through the environment,
+          # like every value that flows into a command, rather than interpolated into the shell.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          sdlc deploy plan --pr "$PR_NUMBER"
+
+  deploy_cloud:
+    name: Provision and deploy to Dev
+    needs: plan
+    if: >-
+      github.event.action != 'closed' &&
+      (needs.plan.outputs.lane == 'azd' ||
+       needs.plan.outputs.lane == 'terraform' ||
+       needs.plan.outputs.lane == 'helm')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # OIDC federation to Azure — no client secret ever exists for CI to leak.
+      id-token: write
+    env:
+      # Already sanitised by `sdlc deploy plan` to 20 lowercase alphanumeric+dash characters, so it
+      # is safe to flow through main.parameters.json into the Bicep environmentName parameter, where
+      # a bad value would fail ten minutes into a provision rather than fast.
+      AZURE_ENV_NAME: ${{ needs.plan.outputs.azure_env_name }}
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION || 'eastus2' }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Check out the feature branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      # Terraform and Helm authenticate to Azure through the Azure CLI credential; azd does its own
+      # federated login below, so it does not need this.
+      - name: Sign in to Azure
+        if: needs.plan.outputs.lane == 'terraform' || needs.plan.outputs.lane == 'helm'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install azd
+        if: needs.plan.outputs.lane == 'azd'
+        uses: Azure/setup-azd@v2
+
+      - name: Provision and deploy with azd
+        id: azd
+        if: needs.plan.outputs.lane == 'azd'
+        run: |
+          set -euo pipefail
+          # Federated login reads AZURE_CLIENT_ID / AZURE_TENANT_ID from the environment and exchanges
+          # the Actions OIDC token; no secret is involved.
+          azd auth login --federated-credential-provider github
+          azd env new "$AZURE_ENV_NAME" --no-prompt
+          azd env set AZURE_LOCATION "$AZURE_LOCATION"
+          azd provision --no-prompt
+          azd deploy --no-prompt
+          # The service endpoint is repo-specific; take the first https URL azd reports for it.
+          url="$(azd show --output json | grep -oE 'https://[^"[:space:]]+' | head -n1 || true)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Apply a Terraform workspace for this pull request
+        id: terraform
+        if: needs.plan.outputs.lane == 'terraform'
+        env:
+          # One workspace per PR isolates this branch's state from every other branch's.
+          TF_WORKSPACE_NAME: ${{ needs.plan.outputs.azure_env_name }}
+          TF_DIR: ${{ vars.SDLC_TF_DIR || '.' }}
+        run: |
+          set -euo pipefail
+          cd "$TF_DIR"
+          terraform init -input=false
+          terraform workspace select -or-create "$TF_WORKSPACE_NAME"
+          terraform apply -input=false -auto-approve -var "environment_name=$TF_WORKSPACE_NAME"
+          # Convention: the root module exposes an `environment_url` output. Absent is not fatal.
+          url="$(terraform output -raw environment_url 2>/dev/null || true)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Install the chart into a per-PR namespace
+        id: helm
+        if: needs.plan.outputs.lane == 'helm'
+        env:
+          # One namespace per PR keeps this branch's release isolated in a shared cluster.
+          HELM_NAMESPACE_NAME: ${{ needs.plan.outputs.azure_env_name }}
+          HELM_CHART_DIR: ${{ vars.SDLC_HELM_CHART || './chart' }}
+          AKS_CLUSTER: ${{ vars.SDLC_AKS_CLUSTER }}
+          AKS_RESOURCE_GROUP: ${{ vars.SDLC_AKS_RESOURCE_GROUP }}
+          INGRESS_DOMAIN: ${{ vars.SDLC_DEV_INGRESS_DOMAIN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$AKS_CLUSTER" ] && [ -n "$AKS_RESOURCE_GROUP" ]; then
+            az aks get-credentials --name "$AKS_CLUSTER" --resource-group "$AKS_RESOURCE_GROUP" --overwrite-existing
+          fi
+          if ! kubectl version --client >/dev/null 2>&1; then
+            echo "::error::kubectl is not available and no cluster credentials were configured. Set SDLC_AKS_CLUSTER and SDLC_AKS_RESOURCE_GROUP, or provide a KUBECONFIG." >&2
+            exit 1
+          fi
+          kubectl create namespace "$HELM_NAMESPACE_NAME" --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install "$HELM_NAMESPACE_NAME" "$HELM_CHART_DIR" \
+            --namespace "$HELM_NAMESPACE_NAME" --create-namespace --wait --timeout 5m
+          if [ -n "$INGRESS_DOMAIN" ]; then
+            echo "url=https://${HELM_NAMESPACE_NAME}.${INGRESS_DOMAIN}" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report the Dev environment
+        if: success()
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_ENVIRONMENT: ${{ needs.plan.outputs.pr_environment }}
+          DEPLOY_URL: >-
+            ${{ steps.azd.outputs.url || steps.terraform.outputs.url || steps.helm.outputs.url }}
+        run: |
+          set -euo pipefail
+          args=(--ref "$HEAD_SHA" --state success --environment "$PR_ENVIRONMENT" --log-url "$RUN_URL")
+          if [ -n "$DEPLOY_URL" ]; then
+            args+=(--environment-url "$DEPLOY_URL")
+          fi
+          sdlc deploy report "${args[@]}"
+
+      - name: Report a failed deployment
+        if: failure()
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_ENVIRONMENT: ${{ needs.plan.outputs.pr_environment }}
+        run: |
+          set -euo pipefail
+          sdlc deploy report --ref "$HEAD_SHA" --state failure --environment "$PR_ENVIRONMENT" --log-url "$RUN_URL" \
+            --description "The Dev deployment failed. See the run log."
+
+  deploy_localhost:
+    name: Serve on the runner behind a public tunnel
+    needs: plan
+    if: github.event.action != 'closed' && needs.plan.outputs.lane == 'localhost'
+    # A GitHub-hosted runner is torn down when the job ends, taking the app and its tunnel with it,
+    # so an honest localhost Dev environment needs a persistent host. Point SDLC_DEV_RUNNER at a
+    # self-hosted runner label; the preflight below refuses to run on an ephemeral runner rather than
+    # reporting a URL that is dead by the time anyone clicks it.
+    runs-on: ${{ vars.SDLC_DEV_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      DEV_PORT: ${{ vars.SDLC_DEV_PORT || '3000' }}
+      HEALTH_PATH: ${{ vars.SDLC_DEV_HEALTH_PATH || '/healthz' }}
+      TUNNEL_PROVIDER: ${{ vars.SDLC_TUNNEL_PROVIDER || 'devtunnel' }}
+    steps:
+      - name: Refuse to run on an ephemeral runner
+        env:
+          ALLOW_EPHEMERAL: ${{ vars.SDLC_ALLOW_EPHEMERAL_TUNNEL }}
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_ENVIRONMENT:-github-hosted}" = "github-hosted" ] && [ "$ALLOW_EPHEMERAL" != "true" ]; then
+            echo "::error::The localhost Dev lane cannot produce a lasting environment on a GitHub-hosted runner: the runner and its tunnel are destroyed when this job ends. Register a self-hosted runner and set the SDLC_DEV_RUNNER variable to its label. To accept a throwaway URL that only lives for the run, set SDLC_ALLOW_EPHEMERAL_TUNNEL=true." >&2
+            exit 1
+          fi
+
+      - name: Check out the feature branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      - name: Start the app
+        run: |
+          set -euo pipefail
+          if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ] || [ -f compose.yml ] || [ -f compose.yaml ]; then
+            docker compose up -d --build
+          elif [ -f Dockerfile ]; then
+            docker build -t sdlc-dev-local .
+            docker run -d --name sdlc-dev-local -p "${DEV_PORT}:${DEV_PORT}" -e "PORT=${DEV_PORT}" sdlc-dev-local
+          else
+            echo "::error::No compose file or Dockerfile was found, so the localhost lane has nothing to run. Add one, or set a deploy strategy override for a lane that fits this repository." >&2
+            exit 1
+          fi
+
+      - name: Wait for the health endpoint
+        run: |
+          set -euo pipefail
+          # Poll rather than sleep: a cold container may take a while, and a fast failure is better
+          # than a fixed wait that is always either too short or too long.
+          curl --fail --silent --show-error --retry 30 --retry-delay 2 \
+            --retry-connrefused --retry-all-errors --max-time 10 \
+            "http://127.0.0.1:${DEV_PORT}${HEALTH_PATH}"
+
+      - name: Open a public tunnel
+        id: tunnel
+        env:
+          DEVTUNNEL_ACCESS_TOKEN: ${{ secrets.SDLC_DEVTUNNEL_TOKEN }}
+          NGROK_AUTHTOKEN: ${{ secrets.SDLC_NGROK_AUTHTOKEN }}
+        run: |
+          set -euo pipefail
+          url=""
+          case "$TUNNEL_PROVIDER" in
+            devtunnel)
+              if ! command -v devtunnel >/dev/null 2>&1; then
+                # Downloaded to a file and then run, rather than piped straight into bash. Without
+                # --fail, curl exits 0 on an HTTP 404 or 502 and pipes the error page into the
+                # shell, which then fails somewhere inside the redirect's HTML with a message that
+                # says nothing about the download. Landing it first means the failure names itself.
+                curl --fail --silent --show-error --location \
+                  --output /tmp/devtunnel-install.sh https://aka.ms/DevTunnelCliInstall
+                bash /tmp/devtunnel-install.sh
+                export PATH="$HOME/bin:$PATH"
+              fi
+              # The runner must be authenticated to the dev tunnel service. On a persistent
+              # self-hosted runner this is usually a one-time `devtunnel user login`; a token can be
+              # supplied via SDLC_DEVTUNNEL_TOKEN for unattended login where the CLI supports it.
+              nohup devtunnel host -p "$DEV_PORT" --allow-anonymous >devtunnel.log 2>&1 &
+              for _ in $(seq 1 30); do
+                url="$(grep -oE 'https://[a-z0-9-]+\.[a-z0-9.-]*devtunnels\.ms[^[:space:]]*' devtunnel.log | head -n1 || true)"
+                if [ -n "$url" ]; then break; fi
+                sleep 2
+              done
+              ;;
+            ngrok)
+              nohup ngrok http "$DEV_PORT" --log stdout >ngrok.log 2>&1 &
+              for _ in $(seq 1 30); do
+                url="$(curl --silent http://127.0.0.1:4040/api/tunnels | grep -oE 'https://[^"[:space:]]+ngrok[^"[:space:]]*' | head -n1 || true)"
+                if [ -n "$url" ]; then break; fi
+                sleep 2
+              done
+              ;;
+            cloudflared)
+              nohup cloudflared tunnel --url "http://127.0.0.1:${DEV_PORT}" >cloudflared.log 2>&1 &
+              for _ in $(seq 1 30); do
+                url="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -n1 || true)"
+                if [ -n "$url" ]; then break; fi
+                sleep 2
+              done
+              ;;
+            *)
+              echo "::error::Unknown SDLC_TUNNEL_PROVIDER '$TUNNEL_PROVIDER'. Expected devtunnel, ngrok or cloudflared." >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "$url" ]; then
+            echo "::error::The $TUNNEL_PROVIDER tunnel did not produce a URL. Check that the runner is authenticated to the tunnel provider." >&2
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Report the Dev environment
+        if: success()
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_ENVIRONMENT: ${{ needs.plan.outputs.pr_environment }}
+          DEPLOY_URL: ${{ steps.tunnel.outputs.url }}
+        run: |
+          set -euo pipefail
+          sdlc deploy report --ref "$HEAD_SHA" --state success --environment "$PR_ENVIRONMENT" \
+            --environment-url "$DEPLOY_URL" --log-url "$RUN_URL"
+
+      - name: Report a failed deployment
+        if: failure()
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_ENVIRONMENT: ${{ needs.plan.outputs.pr_environment }}
+        run: |
+          set -euo pipefail
+          sdlc deploy report --ref "$HEAD_SHA" --state failure --environment "$PR_ENVIRONMENT" --log-url "$RUN_URL" \
+            --description "The localhost Dev deployment failed. See the run log."
+
+  unsupported:
+    name: No lane for this strategy
+    needs: plan
+    if: github.event.action != 'closed' && needs.plan.outputs.supported == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      # Fail loudly rather than let a run go green having deployed nothing. A Dev environment that
+      # silently is not there is worse than one that refuses to start.
+      - name: Explain why nothing was deployed
+        run: |
+          set -euo pipefail
+          echo "::error::This repository's deployment strategy has no dev-deploy lane yet, so the Dev environment was not created. Set an override to a supported lane (azd, terraform, helm or localhost) in .sdlc/config.yml if one fits." >&2
+          exit 1
+
+  teardown:
+    name: Tear down the Dev environment
+    needs: plan
+    # Runs when the pull request closes for any lane that stood a Dev environment up: the
+    # provisioning lanes (azd, Terraform, Helm) that leave paid resources behind, and localhost,
+    # whose per-PR GitHub environment must still be retired even though its runner is already gone.
+    if: >-
+      github.event.action == 'closed' &&
+      (needs.plan.outputs.requires_teardown == 'true' ||
+       needs.plan.outputs.lane == 'localhost')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_ENV_NAME: ${{ needs.plan.outputs.azure_env_name }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Check out the closed branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      - name: Sign in to Azure
+        if: needs.plan.outputs.lane == 'terraform' || needs.plan.outputs.lane == 'helm'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install azd
+        if: needs.plan.outputs.lane == 'azd'
+        uses: Azure/setup-azd@v2
+
+      - name: Tear down the azd environment
+        if: needs.plan.outputs.lane == 'azd'
+        env:
+          # The convention azd names resource groups by. Built from the already-sanitised env name,
+          # passed through the environment so the JMESPath filter below is never assembled from a
+          # raw expression on the command line.
+          RG_PREFIX: rg-${{ needs.plan.outputs.azure_env_name }}
+        run: |
+          set -euo pipefail
+          azd auth login --federated-credential-provider github
+          # azd needs the environment's own state to know what to delete. On a fresh checkout that
+          # state only exists when remote env state is configured; without it, sweep every resource
+          # group azd named for this PR by convention (rg-<env>*). A prefix sweep rather than an
+          # exact `rg-<env>` delete because a single provision can leave more than one group (an AKS
+          # managed cluster spills its nodes into rg-<env>-managed), and a name-exact delete would
+          # leak them.
+          if azd env select "$AZURE_ENV_NAME" >/dev/null 2>&1; then
+            azd down --no-prompt --force --purge
+          else
+            for rg in $(az group list --query "[?starts_with(name, '$RG_PREFIX')].name" -o tsv || true); do
+              az group delete --name "$rg" --yes --no-wait || true
+            done
+          fi
+
+      - name: Delete the Terraform workspace
+        if: needs.plan.outputs.lane == 'terraform'
+        env:
+          TF_WORKSPACE_NAME: ${{ needs.plan.outputs.azure_env_name }}
+          TF_DIR: ${{ vars.SDLC_TF_DIR || '.' }}
+        run: |
+          set -euo pipefail
+          cd "$TF_DIR"
+          terraform init -input=false
+          terraform workspace select "$TF_WORKSPACE_NAME"
+          terraform destroy -input=false -auto-approve -var "environment_name=$TF_WORKSPACE_NAME"
+          # A workspace cannot delete itself, so step off it before removing it.
+          terraform workspace select default
+          terraform workspace delete "$TF_WORKSPACE_NAME"
+
+      - name: Uninstall the Helm release and namespace
+        if: needs.plan.outputs.lane == 'helm'
+        env:
+          HELM_NAMESPACE_NAME: ${{ needs.plan.outputs.azure_env_name }}
+          AKS_CLUSTER: ${{ vars.SDLC_AKS_CLUSTER }}
+          AKS_RESOURCE_GROUP: ${{ vars.SDLC_AKS_RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          if [ -n "$AKS_CLUSTER" ] && [ -n "$AKS_RESOURCE_GROUP" ]; then
+            az aks get-credentials --name "$AKS_CLUSTER" --resource-group "$AKS_RESOURCE_GROUP" --overwrite-existing
+          fi
+          helm uninstall "$HELM_NAMESPACE_NAME" --namespace "$HELM_NAMESPACE_NAME" --ignore-not-found
+          kubectl delete namespace "$HELM_NAMESPACE_NAME" --ignore-not-found
+
+      - name: Retire the Dev environment
+        if: always()
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          PR_ENVIRONMENT: ${{ needs.plan.outputs.pr_environment }}
+        run: |
+          set -euo pipefail
+          # Set every deployment inactive, then delete the per-PR environment. `always()` so the
+          # environment is retired even if the infra teardown above failed, and idempotent: a PR
+          # closed twice, or closed after a provision that created nothing, finds the environment
+          # already gone and still exits zero, so a double-close never fails the job. The write goes
+          # through the App installation, never the default workflow token.
+          sdlc deploy teardown --environment "$PR_ENVIRONMENT"

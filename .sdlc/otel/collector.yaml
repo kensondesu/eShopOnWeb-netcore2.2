@@ -1,0 +1,148 @@
+# OpenTelemetry Collector for the agentic SDLC.
+#
+# A collector is mandatory, not optional. The Copilot SDK emits no telemetry of its own — its
+# TelemetryConfig only injects OTEL_*/COPILOT_OTEL_* environment variables into the CLI subprocess
+# it spawns. Azure Monitor's SDK distros (useAzureMonitor) instrument the host process and cannot
+# receive OTLP from a subprocess, so something must terminate OTLP on the wire. That is this.
+#
+# On a GitHub-hosted runner this runs as a per-job sidecar reached over https://localhost:4318 (the
+# CLI silently disables export over plaintext http, so the runner sidecar terminates TLS on
+# loopback — the composite action generates the cert and merges a TLS overlay). For the long-lived
+# control plane, deploy the non-template copy in `infra/collector/` next to the service.
+#
+# Requires otelcol-contrib. Pin to a recent release: azure_auth versions v0.124.0–v0.150.0 carry a
+# receiver-side auth bypass (GHSA-pjv4-3c63-699f); >= 0.151.0 is safe and the DCR path below needs
+# >= 0.132.0 regardless.
+
+extensions:
+  # A readiness endpoint the workflow polls before it lets the agent start exporting. Without it a
+  # race lets the first spans hit a closed port and vanish.
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      # The Copilot CLI speaks OTLP over HTTP only. `grpc` is unsupported: it warns and falls back.
+      # The runner sidecar overlays `tls:` here so loopback is https and the CLI actually exports.
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Bound memory before the exporter queue does, so a burst of agent runs cannot OOM the collector.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  resource:
+    attributes:
+      - key: service.namespace
+        value: kensondesu/eShopOnWeb-netcore2.2
+        action: upsert
+      - key: deployment.environment.name
+        from_attribute: sdlc.phase
+        action: insert
+
+  # The Copilot CLI has already completed the GenAI semconv migration: it emits
+  # gen_ai.provider.name and never the legacy gen_ai.system. Other producers in the estate (the
+  # Azure SDK in particular) still emit gen_ai.system, so backfill the new key from the old one to
+  # keep every KQL query on a single attribute.
+  transform/genai_provider:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["gen_ai.provider.name"], attributes["gen_ai.system"])
+            where attributes["gen_ai.provider.name"] == nil and attributes["gen_ai.system"] != nil
+          # nano_aiu is AI Units x 1e-9. Materialise the human-scale value once here rather than
+          # dividing in every dashboard query.
+          - set(attributes["sdlc.ai_units"], Double(attributes["github.copilot.nano_aiu"]) / 1000000000.0)
+            where attributes["github.copilot.nano_aiu"] != nil
+
+  # Content capture is disabled for this project. Belt and braces: strip prompt/completion
+  # attributes at the collector even if a runner is misconfigured, so business PII can never reach
+  # the workspace.
+  attributes/strip_content:
+    actions:
+      - key: gen_ai.input.messages
+        action: delete
+      - key: gen_ai.output.messages
+        action: delete
+      - key: gen_ai.system_instructions
+        action: delete
+
+  # tool.definitions is ~1KB of unchanging JSON on every chat and invoke_agent span. It is pure
+  # ingestion cost.
+  attributes/drop_noise:
+    actions:
+      - key: gen_ai.tool.definitions
+        action: delete
+
+exporters:
+  # Beta-stability azuremonitor exporter, connection-string auth. Portable; the only option on a
+  # GitHub-hosted runner, which has no managed identity to satisfy the DCR path.
+  azuremonitor:
+    # Only the env-var NAME is configuration; the connection string is a secret and never appears
+    # in a committed file. The exporter also reads APPLICATIONINSIGHTS_CONNECTION_STRING natively.
+    connection_string: ${env:APPLICATIONINSIGHTS_CONNECTION_STRING}
+    maxbatchsize: 100
+    maxbatchinterval: 10s
+    # Span events carry the CLI's per-request usage and lifecycle events; without this they are
+    # dropped rather than written as trace messages.
+    spaneventsenabled: true
+    # Turn span events named `exception` into Application Insights exceptions so an agent error is
+    # queryable in the exceptions table, not buried in a span. (Real config key, present in the
+    # exporter source; the exporter README does not yet document it.)
+    exception_events_enabled: true
+    # ai.cloud.roleInstance defaults to a random service.instance.id. Prefer the run/branch identity
+    # so the Application Map groups by something meaningful. tag_mappings only governs
+    # cloud_role_instance and application_version — it is NOT a general attribute renamer.
+    tag_mappings:
+      cloud_role_instance: [sdlc.branch, service.instance.id, unknown-run]
+      application_version: [gen_ai.agent.version, service.version]
+    # A durable in-memory queue so a transient ingestion blip does not drop a run's telemetry. In
+    # CI the collector is stopped with SIGTERM after the run, which flushes the queue before exit.
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 2048
+  # Keep a local copy so a collector-side outage does not lose the audit trail, and so the workflow
+  # can assert the run produced spans at all. The runner overlay repoints this under telemetry-out/.
+  file/audit:
+    path: /var/log/otel/sdlc-audit.jsonl
+    rotation:
+      max_megabytes: 100
+      max_backups: 10
+
+service:
+  extensions:
+    - health_check
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - transform/genai_provider
+        - attributes/strip_content
+        - attributes/drop_noise
+        - resource
+        - batch
+      exporters:
+        - azuremonitor
+        - file/audit
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters:
+        - azuremonitor

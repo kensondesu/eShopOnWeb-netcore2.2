@@ -1,0 +1,198 @@
+name: SDLC QA promote
+
+# Runs when a feature lands on main. Everything before this point was reversible — a
+# feature branch, a per-PR Dev environment that gets torn down. QA is the first environment a human
+# has to agree to, and the first artifact that production is allowed to inherit.
+on:
+  push:
+    branches:
+      - main
+  # Re-promoting an existing commit is a legitimate operation: a QA environment can be lost to an
+  # infrastructure failure that has nothing to do with the code. It takes a sha so a re-run promotes
+  # the commit you name rather than whatever has since landed on the branch.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to promote. Defaults to the tip of main.
+        required: false
+        type: string
+
+# One promotion at a time, and never cancel one in flight. A cancelled deploy leaves QA in a state
+# that matches no commit, which is worse than a queue.
+concurrency:
+  group: sdlc-qa-promote
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build the artifact once
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Provenance is signed against the workflow's OIDC identity, so the attestation says which
+      # workflow, at which commit, produced this artifact — not merely that someone uploaded it.
+      id-token: write
+      attestations: write
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Resolve the commit being promoted
+        id: resolve
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Through the environment, never interpolated into the shell: `inputs.sha` is attacker-
+          # influenced on a repo where anyone can dispatch a workflow.
+          sha="${INPUT_SHA:-$PUSH_SHA}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the commit being promoted
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run the repository's tests
+        run: |
+          set -euo pipefail
+          dotnet test
+
+      # Build once. Production later re-uses this exact artifact rather than rebuilding from the
+      # same source, because "the same source" and "the same bytes" are not the same claim: a
+      # dependency published between the two builds silently changes the second one.
+      - name: Build the promotion artifact
+        id: build
+        run: |
+          set -euo pipefail
+          if [ -f Dockerfile ]; then
+            echo "::notice::Building a container image for promotion."
+            docker build -t sdlc-promotion:candidate .
+            docker save sdlc-promotion:candidate -o artifact.tar
+          else
+            # No Dockerfile: promote the source tree itself. It is still a single immutable artifact
+            # with a digest, which is all the promotion gate needs.
+            echo "::notice::No Dockerfile found; promoting an archive of the tree."
+            git archive --format=tar -o artifact.tar HEAD
+          fi
+
+      - name: Compute the artifact digest
+        id: digest
+        run: |
+          set -euo pipefail
+          digest="sha256:$(sha256sum artifact.tar | cut -d' ' -f1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Promotion candidate digest: $digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest the artifact's provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: artifact.tar
+
+      - name: Upload the artifact for QA and production to consume
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdlc-promotion-${{ steps.resolve.outputs.sha }}
+          path: artifact.tar
+          # Long enough that a production promotion days later still finds the bytes QA approved.
+          retention-days: 30
+          if-no-files-found: error
+
+  qa:
+    name: Deploy to QA
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # This single line is the human-in-the-loop gate. GitHub holds the job before any step runs and
+    # waits for the environment's required reviewers to approve it in the GitHub UI.
+    environment:
+      name: qa
+      url: ${{ steps.deploy.outputs.url }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROMOTION_SHA: ${{ needs.build.outputs.sha }}
+      PROMOTION_DIGEST: ${{ needs.build.outputs.digest }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Check out the approved commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the SDLC toolkit
+        uses: kensondesu/agentic_sdlc/.github/actions/sdlc@main
+
+      - name: Download the artifact the gate approved
+        uses: actions/download-artifact@v4
+        with:
+          name: sdlc-promotion-${{ needs.build.outputs.sha }}
+
+      # The artifact travelled through an approval that may have taken hours. Re-checking the digest
+      # costs a second and is the only thing standing between "the reviewer approved X" and
+      # "we deployed X".
+      - name: Verify the artifact is the one that was built
+        run: |
+          set -euo pipefail
+          actual="sha256:$(sha256sum artifact.tar | cut -d' ' -f1)"
+          if [ "$actual" != "$PROMOTION_DIGEST" ]; then
+            echo "::error::Artifact digest changed between build and QA deploy. Expected $PROMOTION_DIGEST, got $actual." >&2
+            exit 1
+          fi
+
+      - name: Sign in to Azure
+        if: env.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to QA
+        id: deploy
+        env:
+          QA_DEPLOY_COMMAND: ${{ vars.SDLC_QA_DEPLOY_COMMAND }}
+          QA_URL: ${{ vars.SDLC_QA_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "$QA_DEPLOY_COMMAND" ]; then
+            bash -c "$QA_DEPLOY_COMMAND"
+          else
+            # No command configured yet. Say so rather than reporting a successful deployment of
+            # nothing — a green QA promotion that deployed nothing is how a broken pipeline survives
+            # for weeks.
+            echo "::warning::SDLC_QA_DEPLOY_COMMAND is not set, so nothing was deployed to QA. The approval and the promotion record are still real; set the variable to make the deployment real too."
+          fi
+          echo "url=$QA_URL" >> "$GITHUB_OUTPUT"
+
+      # This record is what the production gate reads. Without it, `sdlc promote verify` has no
+      # evidence that this commit ever passed QA, and production refuses it.
+      - name: Record the QA deployment
+        if: always()
+        env:
+          SDLC_APP_ID: ${{ vars.SDLC_APP_ID }}
+          SDLC_APP_PRIVATE_KEY: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+          SDLC_APP_INSTALLATION_ID: ${{ vars.SDLC_APP_INSTALLATION_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: |
+          set -euo pipefail
+          sdlc deploy report \
+            --ref "$PROMOTION_SHA" \
+            --environment qa \
+            --state "$STATE" \
+            --environment-url "$DEPLOY_URL" \
+            --log-url "$RUN_URL" \
+            --description "QA promotion of $PROMOTION_DIGEST."
