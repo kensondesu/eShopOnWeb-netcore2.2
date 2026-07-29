@@ -6,8 +6,8 @@
 # requiring a human owner on them is the third layer. Together they mean a change to what the agent
 # is allowed to do cannot be made by the agent.
 
-* @kensondesu
+* @kensondesu @spiff-the-astronaut
 
-/.github/workflows/ @kensondesu
-/.github/CODEOWNERS @kensondesu
-/.sdlc/constitution.md @kensondesu
+/.github/workflows/ @kensondesu @spiff-the-astronaut
+/.github/CODEOWNERS @kensondesu @spiff-the-astronaut
+/.sdlc/constitution.md @kensondesu @spiff-the-astronaut
