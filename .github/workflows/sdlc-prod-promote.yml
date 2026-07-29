@@ -19,6 +19,10 @@ on:
         description: Commit to promote. It must already have succeeded on QA.
         required: true
         type: string
+      qa_run_id:
+        description: Workflow run id of the SDLC QA promote run that produced the artifact.
+        required: true
+        type: number
 
 
 # Never cancel a production deployment in flight. A cancelled progressive rollout leaves traffic
