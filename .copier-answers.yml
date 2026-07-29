@@ -1,7 +1,6 @@
 # Changes here will be overwritten by Copier; edit copier.yml in the template instead.
 _commit: 3dbec5c
-_src_path: /home/fsantos/projects/01 - Tests/agentic_sdlc
-base_branch: main
+_src_path: https://github.com/kensondesu/agentic_sdlc.git
 branch_prefix: feature/
 capture_content: false
 cloud_target: none-localhost
