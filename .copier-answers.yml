@@ -1,5 +1,5 @@
 # Changes here will be overwritten by Copier; edit copier.yml in the template instead.
-_commit: db55e3f
+_commit: 7d69b9e
 _src_path: https://github.com/kensondesu/agentic_sdlc.git
 base_branch: main
 branch_prefix: feature/
