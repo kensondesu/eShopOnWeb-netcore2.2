@@ -106,6 +106,10 @@ jobs:
     # An unanswered question in the specification means the agent would be guessing, and a
     # confidently-wrong implementation costs more to review than no implementation at all.
     if: ${{ inputs.auto_implement && needs.intake.outputs.clarification_count == '0' }}
+    # A called workflow may reduce GITHUB_TOKEN permissions but cannot elevate them. Keep this in
+    # step with sdlc-implement.yml or GitHub rejects the run during startup before creating any job.
+    permissions:
+      contents: read
     uses: ./.github/workflows/sdlc-implement.yml
     with:
       branch: ${{ needs.intake.outputs.branch }}
